@@ -20,6 +20,7 @@
 
 #include "backend/common/target_utils.h"
 #include "rocm/op/builtin.h"
+#include "rocm/target_utils.h"
 
 namespace tvm {
 namespace codegen {
@@ -27,6 +28,69 @@ namespace codegen {
 using namespace ffi;
 
 namespace {
+
+// Native vector values preserve prefetches into shared-memory staging buffers,
+// but can regroup loads and stores in a plain global-to-global copy. Keep that
+// path unchanged, including buffers with mixed consumers or escaping pointers.
+class SharedStagingBufferCollector : public StmtExprVisitor {
+public:
+  using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+
+  static VarSet Collect(const Stmt &body) {
+    SharedStagingBufferCollector collector;
+    collector.VisitStmt(body);
+    for (const Var &var : collector.other_uses_) {
+      collector.shared_staging_buffers_.erase(var);
+    }
+    return std::move(collector.shared_staging_buffers_);
+  }
+
+private:
+  void VisitStmt_(const AllocBufferNode *op) final {
+    StmtExprVisitor::VisitStmt_(op);
+    // The base visitor skips annotations, but HIP emits this initializer as
+    // executable code for local.var buffers. Its reads and escapes count too.
+    if (op->buffer.scope() == "local.var") {
+      auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+      if (init_it != op->annotations.end()) {
+        VisitExpr(Downcast<PrimExpr>((*init_it).second));
+      }
+    }
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    const auto *load = op->value.as<BufferLoadNode>();
+    const std::string scope = op->buffer.scope();
+    if (load && !op->predicate.defined() && !load->predicate.defined() &&
+        (scope == "shared" || scope == "shared.dyn") &&
+        op->buffer->dtype == DataType::BFloat(16) &&
+        load->buffer.scope() == "local" &&
+        load->buffer->dtype == DataType::BFloat(16)) {
+      shared_staging_buffers_.insert(load->buffer->data);
+      // Only this direct load is an allowed consumer. Loads in either index
+      // expression still count as other uses.
+      StmtExprVisitor::VisitExpr_(load);
+      for (const PrimExpr &index : op->indices) {
+        VisitExpr(index);
+      }
+    } else {
+      StmtExprVisitor::VisitStmt_(op);
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    other_uses_.insert(op->buffer->data);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    // A bare data handle can escape through calls or pointer aliases.
+    other_uses_.insert(GetRef<Var>(op));
+  }
+
+  VarSet shared_staging_buffers_;
+  VarSet other_uses_;
+};
 
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
@@ -2121,6 +2185,9 @@ void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
 }
 
 void CodeGenTileLangHIP::VisitStmt_(const AllocBufferNode *op) {
+  if (op->annotations.count(tirx::attr::kVolatile)) {
+    volatile_copy_buffers_.insert(op->buffer->data);
+  }
   std::string vid = AllocVarID(op->buffer->data.get());
 
   this->PrintIndent();
@@ -2188,6 +2255,66 @@ void CodeGenTileLangHIP::VisitStmt_(const AllocBufferNode *op) {
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
 }
 
+bool CodeGenTileLangHIP::TryEmitBF16VectorCopy_(const BufferStore &store) {
+  if (!tl::TargetIsGfx1200(target_) || store->predicate.defined() ||
+      !shared_staging_buffers_.count(store->buffer->data) ||
+      store->indices.size() != 1 ||
+      store->buffer->dtype != DataType::BFloat(16) ||
+      store->value.dtype() != DataType::BFloat(16, 8)) {
+    return false;
+  }
+  const auto *load = store->value.as<BufferLoadNode>();
+  if (!load || load->predicate.defined() || load->indices.size() != 1 ||
+      load->buffer->dtype != DataType::BFloat(16) ||
+      volatile_copy_buffers_.count(store->buffer->data) ||
+      volatile_copy_buffers_.count(load->buffer->data) ||
+      IsVolatile(store->buffer->data.get()) ||
+      IsVolatile(load->buffer->data.get())) {
+    return false;
+  }
+  auto storage_scope = [this](const Buffer &buffer) -> std::string {
+    auto it = alloc_storage_scope_.find(buffer->data.get());
+    if (it != alloc_storage_scope_.end()) {
+      return it->second;
+    }
+    return GetPtrStorageScope(buffer->data);
+  };
+  if (storage_scope(store->buffer) != "local" ||
+      storage_scope(load->buffer) != "global") {
+    return false;
+  }
+  const auto *dst = store->indices[0].as<RampNode>();
+  const auto *src = load->indices[0].as<RampNode>();
+  auto aligned_ramp = [](const PrimExpr &index) {
+    const auto *ramp = index.as<RampNode>();
+    if (!ramp || !is_one(ramp->stride) || !is_const_int(ramp->lanes, 8)) {
+      return false;
+    }
+    // Match CodeGenC's vector-load alignment proof, for both endpoints.
+    arith::ModularSet alignment = arith::Analyzer().modular_set(ramp->base);
+    return alignment->coeff % 8 == 0 && alignment->base % 8 == 0;
+  };
+  if (!aligned_ramp(store->indices[0]) || !aligned_ramp(load->indices[0])) {
+    return false;
+  }
+
+  // HIP uint4 is an aggregate: assignment becomes memcpy, which can forward
+  // staged global reads to their later shared stores or retain private memory.
+  // Keep the copy as a native vector value without changing other BF16 uses.
+  std::string src_ref =
+      GetBufferRef(load->buffer->dtype, load->buffer.get(), src->base);
+  std::string dst_ref =
+      GetBufferRef(store->buffer->dtype, store->buffer.get(), dst->base);
+  // An unnamed type cannot shadow user variables or external function names.
+  // may_alias preserves the bit-copy contract of BF16 backing storage.
+  const char *copy_type =
+      "unsigned int __attribute__((vector_size(16), may_alias))";
+  PrintIndent();
+  stream << "*(" << copy_type << "*)(&(" << dst_ref << ")) = *(const "
+         << copy_type << "*)(&(" << src_ref << "));\n";
+  return true;
+}
+
 void CodeGenTileLangHIP::VisitStmt_(const BufferStoreNode *op) {
   ICHECK_EQ(op->indices.size(), 1) << "Store to non-flat memory not supported.";
   ICHECK(!op->predicate.defined())
@@ -2213,6 +2340,10 @@ void CodeGenTileLangHIP::VisitStmt_(const BufferStoreNode *op) {
              << GetVarID(buffer_var.get()) << ", " << idx_str << ", " << value
              << ");\n";
     }
+    return;
+  }
+
+  if (TryEmitBF16VectorCopy_(GetRef<BufferStore>(op))) {
     return;
   }
 
@@ -2566,6 +2697,11 @@ void CodeGenTileLangHIP::PrintVecElemLoadExpr(DataType t, int i,
 void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   // clear previous generated state.
   this->InitFuncState(f);
+  volatile_copy_buffers_.clear();
+  shared_staging_buffers_.clear();
+  if (tl::TargetIsGfx1200(target_)) {
+    shared_staging_buffers_ = SharedStagingBufferCollector::Collect(f->body);
+  }
   // reserve keywords
   ReserveKeywordsAsUnique();
 

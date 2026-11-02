@@ -13,6 +13,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "backend/common/codegen/codegen_c_base.h"
 
@@ -68,6 +69,16 @@ protected:
                        std::ostream &os) final; // NOLINT(*)
 
 private:
+  bool TryEmitBF16VectorCopy_(const BufferStore &store);
+
+  // Local buffers read only by direct BF16 stores into shared memory.
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      shared_staging_buffers_;
+
+  // Keep volatile allocations on the existing copy-emission path.
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      volatile_copy_buffers_;
+
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;
